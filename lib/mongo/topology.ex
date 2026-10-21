@@ -80,8 +80,7 @@ defmodule Mongo.Topology do
   end
 
   def select_server(pid, type, opts \\ []) do
-    timeout = Keyword.get(opts, :checkout_timeout, @default_checkout_timeout)
-    GenServer.call(pid, {:select_server, type, opts}, timeout)
+    call_with_checkout_timeout(pid, {:select_server, type, opts}, opts)
   end
 
   def mark_server_unknown(pid, address) do
@@ -98,8 +97,31 @@ defmodule Mongo.Topology do
   end
 
   def checkout_session(pid, read_write_type, opts \\ []) do
+    call_with_checkout_timeout(pid, {:checkout_session, read_write_type, opts}, opts)
+  end
+
+  defp call_with_checkout_timeout(pid, request, opts) do
     timeout = Keyword.get(opts, :checkout_timeout, @default_checkout_timeout)
-    GenServer.call(pid, {:checkout_session, read_write_type, opts}, timeout)
+    deadline = if timeout == :infinity, do: :infinity, else: System.monotonic_time(:millisecond) + timeout
+    call_until_deadline(pid, request, timeout, deadline)
+  end
+
+  # A waiting caller gets `:new_connection` and asks again, so one deadline covers every attempt.
+  defp call_until_deadline(pid, request, timeout, deadline) do
+    remaining = if deadline == :infinity, do: :infinity, else: deadline - System.monotonic_time(:millisecond)
+
+    reply =
+      try do
+        if remaining > 0, do: GenServer.call(pid, request, remaining), else: :timeout
+      catch
+        :exit, {:timeout, _} -> :timeout
+      end
+
+    case reply do
+      :new_connection -> call_until_deadline(pid, request, timeout, deadline)
+      :timeout -> {:error, Mongo.Error.exception("server selection timeout after #{timeout} ms")}
+      reply -> reply
+    end
   end
 
   def checkin_session(pid, server_session) do
