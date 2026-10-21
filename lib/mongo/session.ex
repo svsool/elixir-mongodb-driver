@@ -187,6 +187,14 @@ defmodule Mongo.Session do
   end
 
   @doc """
+  Mark the current transaction as aborted without sending `abortTransaction`, for errors after which the server already aborted it.
+  """
+  @spec mark_aborted(Session.t()) :: :ok
+  def mark_aborted(pid) do
+    call(pid, :mark_aborted)
+  end
+
+  @doc """
   Merge the session / transaction data into the cmd. There is no need to call this function directly. It is called automatically.
   The global session timeout is merged to the options as well.
   """
@@ -540,6 +548,7 @@ defmodule Mongo.Session do
   def handle_call_event({:commit_transaction, start_time}, :transaction_in_progress, data) do
     case run_commit_command(data, start_time) do
       :ok -> {:next_state, :transaction_committed, :ok}
+      {:write_concern_error, error} -> {:next_state, :transaction_committed, {:error, error}}
       error -> {:keep_state_and_data, error}
     end
   end
@@ -558,6 +567,14 @@ defmodule Mongo.Session do
   end
 
   def handle_call_event(:abort_transaction, _state, _data) do
+    {:keep_state_and_data, :ok}
+  end
+
+  def handle_call_event(:mark_aborted, transaction, _data) when transaction in [:starting_transaction, :transaction_in_progress] do
+    {:next_state, :transaction_aborted, :ok}
+  end
+
+  def handle_call_event(:mark_aborted, _state, _data) do
     {:keep_state_and_data, :ok}
   end
 
@@ -631,7 +648,11 @@ defmodule Mongo.Session do
       ]
       |> filter_nils()
 
-    case Mongo.exec_command(conn, cmd, database: "admin") do
+    case Mongo.exec_command(conn, cmd, merge_timeout([database: "admin"], opts)) do
+      {:ok, {_flags, %{"writeConcernError" => wce} = doc}} ->
+        labels = ["UnknownTransactionCommitResult" | doc["errorLabels"] || []]
+        {:write_concern_error, Mongo.Error.exception(%{"code" => wce["code"], "errmsg" => wce["errmsg"] || "write concern error", "errInfo" => wce["errInfo"], "errorLabels" => labels})}
+
       {:ok, _doc} ->
         :ok
 
@@ -641,10 +662,17 @@ defmodule Mongo.Session do
 
         case try_again do
           true -> run_commit_command(session, time, :retry)
-          false -> {:error, error}
+          false -> {:error, label_network_error(error)}
         end
     end
   end
+
+  # A lost commit reply has an unknown outcome; labelled after the retry decision so a socket timeout is not retried past its budget.
+  defp label_network_error(%Mongo.Error{code: nil, host: host, error_labels: labels} = error) when is_binary(host) do
+    %Mongo.Error{error | error_labels: ["UnknownTransactionCommitResult" | labels || []]}
+  end
+
+  defp label_network_error(error), do: error
 
   defp max_time_ms(opts) do
     opts |> Keyword.get(:max_commit_time_ms) |> optional_int64()
@@ -667,7 +695,7 @@ defmodule Mongo.Session do
       ]
       |> filter_nils()
 
-    _doc = Mongo.exec_command(conn, cmd, database: "admin")
+    _doc = Mongo.exec_command(conn, cmd, merge_timeout([database: "admin"], opts))
 
     :ok
   end
