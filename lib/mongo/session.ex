@@ -142,13 +142,7 @@ defmodule Mongo.Session do
   """
   @spec start_session(GenServer.server(), atom, keyword()) :: {:ok, Session.t()} | {:error, term()}
   def start_session(topology_pid, read_write_type, opts \\ []) do
-    case Topology.checkout_session(topology_pid, read_write_type, opts) do
-      {:ok, session} ->
-        {:ok, session}
-
-      :new_connection ->
-        start_session(topology_pid, read_write_type, opts)
-    end
+    Topology.checkout_session(topology_pid, read_write_type, opts)
   end
 
   def mark_server_unknown(pid) do
