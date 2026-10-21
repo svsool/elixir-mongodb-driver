@@ -37,6 +37,18 @@ defmodule Mongo.CheckoutTimeoutTest do
     end
   end
 
+  describe "with a stopped topology" do
+    setup do
+      start_supervised!({Mongo, database: "mongodb_test", seeds: ["127.0.0.1:1"], pool_size: 1, name: :checkout_timeout_stopped})
+      stop_supervised!(Mongo)
+      %{top: :checkout_timeout_stopped}
+    end
+
+    test "insert_one returns a topology error", %{top: top} do
+      assert {:error, %Error{message: "topology not available: noproc"}} = Mongo.insert_one(top, "checkout_timeout_test", %{name: "Greta"})
+    end
+  end
+
   test "checkout_timeout does not change a call on a reachable server" do
     {:ok, top} = Mongo.TestConnection.connect()
 

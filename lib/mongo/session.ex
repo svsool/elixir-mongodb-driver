@@ -383,10 +383,16 @@ defmodule Mongo.Session do
 
   @compile {:inline, call: 2}
   defp call(pid, arguments) do
+    ref = Process.monitor(pid)
     send(pid, {:call, self(), arguments})
 
     receive do
-      {:session_result, result} -> result
+      {:session_result, result} ->
+        Process.demonitor(ref, [:flush])
+        result
+
+      {:DOWN, ^ref, :process, _pid, _reason} ->
+        {:error, Mongo.Error.exception("session process exited")}
     end
   end
 
@@ -463,6 +469,10 @@ defmodule Mongo.Session do
 
   def handle_call_event(:start_transaction, transaction, %Session{server_session: session} = data) when transaction in [:no_transaction, :transaction_aborted, :transaction_committed, :transaction_commit_unconfirmed] do
     {:next_state, :starting_transaction, %Session{data | recovery_token: nil, server_session: ServerSession.next_txn_num(session)}, :ok}
+  end
+
+  def handle_call_event(:start_transaction, _transaction, _data) do
+    {:keep_state_and_data, {:error, Mongo.Error.exception("transaction already in progress")}}
   end
 
   ##
@@ -551,9 +561,16 @@ defmodule Mongo.Session do
     end
   end
 
-  ## in other cases we will ignore the commit command
-  def handle_call_event({:commit_transaction, _start_time}, _state, _data) do
+  def handle_call_event({:commit_transaction, _start_time}, :transaction_committed, _data) do
     {:keep_state_and_data, :ok}
+  end
+
+  def handle_call_event({:commit_transaction, _start_time}, :transaction_aborted, _data) do
+    {:keep_state_and_data, {:error, Mongo.Error.exception("cannot commit an aborted transaction")}}
+  end
+
+  def handle_call_event({:commit_transaction, _start_time}, :no_transaction, _data) do
+    {:keep_state_and_data, {:error, Mongo.Error.exception("no transaction started")}}
   end
 
   def handle_call_event(:abort_transaction, :starting_transaction, _data) do
@@ -589,9 +606,9 @@ defmodule Mongo.Session do
   end
 
   def handle_call_event({:select_server, opts}, _state, %Session{topology: topology} = data) do
-    case Topology.select_server(topology, :write, opts) do
-      {:ok, conn} ->
-        {:keep_state, %Session{data | conn: conn}}
+    case Topology.select_server_binding(topology, :write, opts) do
+      {:ok, conn, address, wire_version} ->
+        {:keep_state, %Session{data | conn: conn, address: address, wire_version: wire_version}}
 
       _ ->
         {:keep_state_and_data, :noop}
@@ -601,6 +618,12 @@ defmodule Mongo.Session do
   def handle_call_event(:mark_server_unknown, _state, %Session{topology: topology, address: address}) do
     Topology.mark_server_unknown(topology, address)
     {:keep_state_and_data, :ok}
+  end
+
+  # A crash here would also stop the linked topology, so an unmatched call gets an error reply.
+  def handle_call_event(event, _state, _data) do
+    name = if is_tuple(event), do: elem(event, 0), else: event
+    {:keep_state_and_data, {:error, Mongo.Error.exception("unsupported session call #{inspect(name)}")}}
   end
 
   def handle_cast_event({:update_recovery_token, recovery_token}, _state, %Session{} = data) do
@@ -656,17 +679,17 @@ defmodule Mongo.Session do
 
         case try_again do
           true -> run_commit_command(session, time, :retry)
-          false -> {:error, label_network_error(error)}
+          false -> {:error, label_network_error(error, n)}
         end
     end
   end
 
-  # A lost commit reply has an unknown outcome; labelled after the retry decision so a socket timeout is not retried past its budget.
-  defp label_network_error(%Mongo.Error{code: nil, host: host, error_labels: labels} = error) when is_binary(host) do
+  # A lost commit reply, or a retry that got no server reply, leaves the outcome unknown; labelled after the retry decision so a socket timeout is not retried past its budget.
+  defp label_network_error(%Mongo.Error{code: nil, host: host, error_labels: labels} = error, attempt) when is_binary(host) or attempt == :retry do
     %Mongo.Error{error | error_labels: ["UnknownTransactionCommitResult" | labels || []]}
   end
 
-  defp label_network_error(error), do: error
+  defp label_network_error(error, _attempt), do: error
 
   defp max_time_ms(opts) do
     opts |> Keyword.get(:max_commit_time_ms) |> optional_int64()

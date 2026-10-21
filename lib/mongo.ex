@@ -214,7 +214,7 @@ defmodule Mongo do
         timeout = opts[:transaction_retry_timeout_s] || @retry_timeout_seconds
 
         case Error.has_label(error, "TransientTransactionError") && DateTime.diff(DateTime.utc_now(), start_time, :second) < timeout &&
-               sleep_retry_jitter(opts[:transaction_retry_jitter_ms], start_time, timeout) do
+               select_writable_server(session, error, start_time, timeout) && sleep_retry_jitter(opts[:transaction_retry_jitter_ms], start_time, timeout) do
           true ->
             run_in_transaction(topology_pid, session, fun, start_time, opts)
 
@@ -236,6 +236,14 @@ defmodule Mongo do
   # WriteConflict and NoSuchTransaction mean the server already aborted the transaction
   defp server_aborted?(%Mongo.Error{code: code}), do: code in [112, 251]
   defp server_aborted?(_error), do: false
+
+  # The session keeps its connection, so after a step-down it waits for a new primary for the rest of the rerun window.
+  defp select_writable_server(session, %Mongo.Error{not_writable_primary_or_recovering: true}, start_time, timeout_s) do
+    remaining_ms = remaining_ms(start_time, timeout_s)
+    remaining_ms > 0 and Session.select_server(session, checkout_timeout: remaining_ms) == :ok
+  end
+
+  defp select_writable_server(_session, _error, _start_time, _timeout_s), do: true
 
   # The jitter never sleeps past the rerun window, and no rerun starts after it.
   defp sleep_retry_jitter(jitter_ms, start_time, timeout_s) when is_integer(jitter_ms) and jitter_ms > 0 do
@@ -1661,7 +1669,7 @@ defmodule Mongo do
           {:ok, BSON.document() | nil} | {:error, Mongo.Error.t()}
   def exec_command_session(session, cmd, opts) do
     with {:ok, conn, new_cmd, opts} <- Session.bind_session(session, cmd, opts),
-         {:ok, _cmd, response} <- DBConnection.execute(conn, %Query{action: {:command, new_cmd}}, [], opts),
+         {:ok, _cmd, response} <- execute_command(conn, new_cmd, opts),
          :ok <- Session.update_session(session, response, opts),
          {:ok, {_flags, doc}} <- check_for_error(response, cmd, opts) do
       {:ok, doc}
@@ -1675,9 +1683,18 @@ defmodule Mongo do
   @spec exec_command(GenServer.server(), BSON.document(), Keyword.t()) ::
           {:ok, {any(), BSON.document()} | nil} | {:error, Mongo.Error.t()}
   def exec_command(conn, cmd, opts) do
-    with {:ok, _cmd, response} <- DBConnection.execute(conn, %Query{action: {:command, cmd}}, [], opts) do
+    with {:ok, _cmd, response} <- execute_command(conn, cmd, opts) do
       check_for_error(response, cmd, opts)
     end
+  end
+
+  # A session keeps its pool after the topology closes it, and DBConnection exits on a closed pool; the commit and the abort run in the linked session.
+  defp execute_command(conn, cmd, opts) do
+    DBConnection.execute(conn, %Query{action: {:command, cmd}}, [], opts)
+  catch
+    # A crash reason can hold the topology state with its credentials, so only an atom reason goes into the message.
+    :exit, {reason, {DBConnection.Holder, :checkout, _args}} ->
+      {:error, Error.exception("connection pool not available: #{if is_atom(reason), do: reason, else: "exited"}")}
   end
 
   def exec_hello(conn, opts) do
@@ -1697,6 +1714,8 @@ defmodule Mongo do
       check_for_error(response, :more_to_come, opts)
     end
   end
+
+  def check_monitor_response(response, cmd, opts), do: check_for_error(response, cmd, opts)
 
   @doc """
   Generates a new `BSON.ObjectId`.

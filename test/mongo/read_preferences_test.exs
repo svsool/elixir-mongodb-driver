@@ -89,7 +89,7 @@ defmodule Mongo.ReadPreferencesTest do
       tags: [dc: "south", usage: "production"]
     }
 
-    assert catch_exit(Mongo.find_one(top, coll, %{name: "Oskar"}, read_preference: prefs, checkout_timeout: 500))
+    assert {:error, %Mongo.Error{}} = Mongo.find_one(top, coll, %{name: "Oskar"}, read_preference: prefs, checkout_timeout: 500)
     assert [:checkout_session | _xs] = EventCatcher.empty_selection_events(catcher) |> Enum.map(fn event -> event.action end)
   end
 
