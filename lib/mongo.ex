@@ -213,7 +213,8 @@ defmodule Mongo do
         if server_aborted?(error), do: Session.mark_aborted(session), else: Session.abort_transaction(session)
         timeout = opts[:transaction_retry_timeout_s] || @retry_timeout_seconds
 
-        case Error.has_label(error, "TransientTransactionError") && DateTime.diff(DateTime.utc_now(), start_time, :second) < timeout do
+        case Error.has_label(error, "TransientTransactionError") && DateTime.diff(DateTime.utc_now(), start_time, :second) < timeout &&
+               select_writable_server(session, error, start_time, timeout) do
           true ->
             sleep_retry_jitter(opts[:transaction_retry_jitter_ms])
             run_in_transaction(topology_pid, session, fun, start_time, opts)
@@ -236,6 +237,14 @@ defmodule Mongo do
   # WriteConflict and NoSuchTransaction mean the server already aborted the transaction
   defp server_aborted?(%Mongo.Error{code: code}), do: code in [112, 251]
   defp server_aborted?(_error), do: false
+
+  # The session keeps its connection, so after a step-down it waits for a new primary for the rest of the rerun window.
+  defp select_writable_server(session, %Mongo.Error{not_writable_primary_or_recovering: true}, start_time, timeout_s) do
+    remaining_ms = trunc(timeout_s * 1_000) - DateTime.diff(DateTime.utc_now(), start_time, :millisecond)
+    remaining_ms > 0 and Session.select_server(session, checkout_timeout: remaining_ms) == :ok
+  end
+
+  defp select_writable_server(_session, _error, _start_time, _timeout_s), do: true
 
   defp sleep_retry_jitter(jitter_ms) when is_integer(jitter_ms) and jitter_ms > 0, do: Process.sleep(:rand.uniform(jitter_ms))
   defp sleep_retry_jitter(_jitter_ms), do: :ok
@@ -1690,6 +1699,9 @@ defmodule Mongo do
       check_for_error(response, :more_to_come, opts)
     end
   end
+
+  @doc false
+  def check_monitor_response(response, cmd, opts), do: check_for_error(response, cmd, opts)
 
   @doc """
   Generates a new `BSON.ObjectId`.

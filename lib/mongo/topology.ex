@@ -80,7 +80,16 @@ defmodule Mongo.Topology do
   end
 
   def select_server(pid, type, opts \\ []) do
-    call_with_checkout_timeout(pid, {:select_server, type, opts}, opts)
+    with {:ok, connection, _address, _wire_version} <- select_server_binding(pid, type, opts) do
+      {:ok, connection}
+    end
+  end
+
+  @doc """
+  Like `select_server/3`, but also returns the address and the wire version of the selected server.
+  """
+  def select_server_binding(pid, type, opts \\ []) do
+    call_with_checkout_timeout(pid, fn _deadline -> {:select_server, type, opts} end, opts)
   end
 
   def mark_server_unknown(pid, address) do
@@ -97,13 +106,13 @@ defmodule Mongo.Topology do
   end
 
   def checkout_session(pid, read_write_type, opts \\ []) do
-    call_with_checkout_timeout(pid, {:checkout_session, read_write_type, opts}, opts)
+    call_with_checkout_timeout(pid, &{:checkout_session, read_write_type, opts, &1}, opts)
   end
 
-  defp call_with_checkout_timeout(pid, request, opts) do
+  defp call_with_checkout_timeout(pid, request_fun, opts) do
     timeout = Keyword.get(opts, :checkout_timeout, @default_checkout_timeout)
     deadline = if timeout == :infinity, do: :infinity, else: System.monotonic_time(:millisecond) + timeout
-    call_until_deadline(pid, request, timeout, deadline)
+    call_until_deadline(pid, request_fun.(deadline), timeout, deadline)
   end
 
   # A waiting caller gets `:new_connection` and asks again, so one deadline covers every attempt.
@@ -438,32 +447,12 @@ defmodule Mongo.Topology do
   ##
   # checkout a new session
   #
-  def handle_call({:checkout_session, read_write_type, opts}, from, %{:topology => topology, :waiting_pids => waiting} = state) do
-    opts = merge_read_preferences(read_write_type, opts, state.opts)
-
-    case TopologyDescription.select_servers(topology, read_write_type, opts) do
-      :empty ->
-        Mongo.Events.notify(%ServerSelectionEmptyEvent{action: :checkout_session, cmd_type: read_write_type, topology: topology, opts: opts})
-        ## no servers available, wait for connection
-        {:noreply, %{state | waiting_pids: [from | waiting]}}
-
-      ## found
-      {:ok, {address, opts}} ->
-        opts = merge_timeout(opts, state.opts)
-
-        with {:ok, connection} <- get_connection(address, state),
-             wire_version <- wire_version(address, topology),
-             {server_session, new_state} <- checkout_server_session(state),
-             {:ok, session} <- Session.start_link(self(), connection, address, server_session, wire_version, opts) do
-          {:reply, {:ok, session}, new_state}
-        else
-          ## in case of an error, just return the error
-          error -> {:reply, error, state}
-        end
-
-      error ->
-        ## in case of an error, just return the error
-        {:reply, error, state}
+  # A caller that timed out never gets the reply, so a session started for it would leak.
+  def handle_call({:checkout_session, read_write_type, opts, deadline}, from, state) do
+    if deadline != :infinity and deadline <= System.monotonic_time(:millisecond) do
+      {:reply, :timeout, state}
+    else
+      start_session(read_write_type, opts, from, state)
     end
   end
 
@@ -479,7 +468,7 @@ defmodule Mongo.Topology do
       {:ok, {address, _opts}} ->
         case get_connection(address, state) do
           {:ok, connection} ->
-            {:reply, {:ok, connection}, state}
+            {:reply, {:ok, connection, address, wire_version(address, topology)}, state}
 
           ## in case of an error, just return the error
           error ->
@@ -517,6 +506,35 @@ defmodule Mongo.Topology do
 
       {:ok, {address, _opts}} ->
         {:reply, {:ok, wire_version(address, topology)}, state}
+
+      error ->
+        ## in case of an error, just return the error
+        {:reply, error, state}
+    end
+  end
+
+  defp start_session(read_write_type, opts, from, %{:topology => topology, :waiting_pids => waiting} = state) do
+    opts = merge_read_preferences(read_write_type, opts, state.opts)
+
+    case TopologyDescription.select_servers(topology, read_write_type, opts) do
+      :empty ->
+        Mongo.Events.notify(%ServerSelectionEmptyEvent{action: :checkout_session, cmd_type: read_write_type, topology: topology, opts: opts})
+        ## no servers available, wait for connection
+        {:noreply, %{state | waiting_pids: [from | waiting]}}
+
+      ## found
+      {:ok, {address, opts}} ->
+        opts = merge_timeout(opts, state.opts)
+
+        with {:ok, connection} <- get_connection(address, state),
+             wire_version <- wire_version(address, topology),
+             {server_session, new_state} <- checkout_server_session(state),
+             {:ok, session} <- Session.start_link(self(), connection, address, server_session, wire_version, opts) do
+          {:reply, {:ok, session}, new_state}
+        else
+          ## in case of an error, just return the error
+          error -> {:reply, error, state}
+        end
 
       error ->
         ## in case of an error, just return the error

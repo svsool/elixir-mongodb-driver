@@ -119,11 +119,15 @@ defmodule Mongo.StreamingHelloMonitor do
           %{state | more_to_come: true}
 
         _other ->
-          Process.send_after(self(), :update, state.heartbeat_frequency_ms)
+          Process.send_after(self(), :update, next_check_ms(state))
           %{state | more_to_come: false}
       end
     end
   end
+
+  # An awaitable hello returns on the next topology change, so a pause before the next one hides a step-down.
+  defp next_check_ms(%{topology_version: nil, heartbeat_frequency_ms: heartbeat_frequency_ms}), do: heartbeat_frequency_ms
+  defp next_check_ms(_state), do: 0
 
   # see https://github.com/mongodb/specifications/blob/master/source/server-discovery-and-monitoring/server-discovery-and-monitoring.rst#network-error-when-calling-ismaster
   ##
@@ -137,7 +141,7 @@ defmodule Mongo.StreamingHelloMonitor do
     {duration, result} =
       case state do
         %{more_to_come: true} ->
-          :timer.tc(fn -> Mongo.exec_more_to_come(conn_pid, opts) end)
+          :timer.tc(fn -> execute(conn_pid, :more_to_come, :more_to_come, opts) end)
 
         _other ->
           opts = Keyword.put(opts, :max_await_time_ms, max_await_time_ms)
@@ -184,11 +188,18 @@ defmodule Mongo.StreamingHelloMonitor do
       }
     ]
 
-    Mongo.exec_hello(conn_pid, cmd, opts)
+    execute(conn_pid, {:exec_hello, cmd}, :exec_hello, opts)
   end
 
   defp hello_command(conn_pid, _topology_version, opts) do
-    Mongo.exec_hello(conn_pid, opts)
+    execute(conn_pid, {:exec_hello, []}, :exec_hello, opts)
+  end
+
+  # Waits in DBConnection, not in Mongo, so a purge of the Mongo module (test mocks) does not kill the monitor.
+  defp execute(conn_pid, action, cmd, opts) do
+    with {:ok, _query, response} <- DBConnection.execute(conn_pid, %Mongo.Query{action: action}, [], opts) do
+      Mongo.check_monitor_response(response, cmd, opts)
+    end
   end
 
   defp notify_error(duration, error, conn_pid) do

@@ -388,10 +388,16 @@ defmodule Mongo.Session do
 
   @compile {:inline, call: 2}
   defp call(pid, arguments) do
+    ref = Process.monitor(pid)
     send(pid, {:call, self(), arguments})
 
     receive do
-      {:session_result, result} -> result
+      {:session_result, result} ->
+        Process.demonitor(ref, [:flush])
+        result
+
+      {:DOWN, ^ref, :process, _pid, _reason} ->
+        {:error, Mongo.Error.exception("session process exited")}
     end
   end
 
@@ -591,9 +597,9 @@ defmodule Mongo.Session do
   end
 
   def handle_call_event({:select_server, opts}, _state, %Session{topology: topology} = data) do
-    case Topology.select_server(topology, :write, opts) do
-      {:ok, conn} ->
-        {:keep_state, %Session{data | conn: conn}}
+    case Topology.select_server_binding(topology, :write, opts) do
+      {:ok, conn, address, wire_version} ->
+        {:keep_state, %Session{data | conn: conn, address: address, wire_version: wire_version}}
 
       _ ->
         {:keep_state_and_data, :noop}
