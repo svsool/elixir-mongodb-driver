@@ -179,7 +179,7 @@ defmodule Mongo.ChangeStreamTest do
     top = c.pid
     me = self()
     spawn(fn -> consumer_1(top, me) end)
-    spawn(fn -> producer(top) end)
+    first_producer = Task.async(fn -> producer(top) end)
 
     assert_receive {:token, _}, 5_000
     assert_receive {:token, token}, 5_000
@@ -190,7 +190,7 @@ defmodule Mongo.ChangeStreamTest do
     assert {:ok, %Mongo.InsertOneResult{}} = Mongo.insert_one(top, "users", %{name: "Liese"})
 
     spawn(fn -> consumer_2(top, me, token) end)
-    spawn(fn -> producer(top) end)
+    second_producer = Task.async(fn -> producer(top) end)
 
     assert_receive {:token, _}, 5_000
     assert_receive {:insert, %{"fullDocument" => %{"name" => "Gustav"}}}, 5_000
@@ -198,9 +198,12 @@ defmodule Mongo.ChangeStreamTest do
     # Process.sleep(500)
 
     spawn(fn -> consumer_3(top, me, token) end)
-    spawn(fn -> producer(top) end)
+    third_producer = Task.async(fn -> producer(top) end)
 
     assert_receive {:token, _}, 5_000
     assert_receive {:insert, ["Gustav", "Tom", "Liese", "Greta"]}, 5_000
+
+    # The producers insert after the assertions, so wait for them to keep their writes out of later tests.
+    Task.await_many([first_producer, second_producer, third_producer], 5_000)
   end
 end
