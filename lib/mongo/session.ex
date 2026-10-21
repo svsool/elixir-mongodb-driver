@@ -101,6 +101,7 @@ defmodule Mongo.Session do
   alias Mongo.Topology
 
   @retry_timeout_seconds 120
+  @retry_commit_wtimeout_ms 10_000
 
   @type t :: pid()
 
@@ -184,6 +185,14 @@ defmodule Mongo.Session do
   @spec abort_transaction(Session.t()) :: :ok | {:error, term()}
   def abort_transaction(pid) do
     call(pid, :abort_transaction)
+  end
+
+  @doc """
+  Mark the current transaction as aborted without sending `abortTransaction`, for errors after which the server already aborted it.
+  """
+  @spec mark_aborted(Session.t()) :: :ok
+  def mark_aborted(pid) do
+    call(pid, :mark_aborted)
   end
 
   @doc """
@@ -458,7 +467,7 @@ defmodule Mongo.Session do
     nil
   end
 
-  def handle_call_event(:start_transaction, transaction, %Session{server_session: session} = data) when transaction in [:no_transaction, :transaction_aborted, :transaction_committed] do
+  def handle_call_event(:start_transaction, transaction, %Session{server_session: session} = data) when transaction in [:no_transaction, :transaction_aborted, :transaction_committed, :transaction_commit_unconfirmed] do
     {:next_state, :starting_transaction, %Session{data | recovery_token: nil, server_session: ServerSession.next_txn_num(session)}, :ok}
   end
 
@@ -466,7 +475,7 @@ defmodule Mongo.Session do
   # bind session: only if wire_version >= 6, MongoDB 3.6.x and no transaction is running: only lsid and the transaction-id is added
   #
   def handle_call_event({:bind_session, cmd, client_opts}, transaction, %Session{conn: conn, opts: opts, wire_version: wire_version, server_session: %ServerSession{session_id: id, txn_num: txn_num}} = data)
-      when wire_version >= 6 and transaction in [:no_transaction, :transaction_aborted, :transaction_committed] do
+      when wire_version >= 6 and transaction in [:no_transaction, :transaction_aborted, :transaction_committed, :transaction_commit_unconfirmed] do
     ## only if retryable_writes are enabled!
     options =
       case opts[:retryable_writes] do
@@ -537,9 +546,13 @@ defmodule Mongo.Session do
     {:next_state, :transaction_committed, :ok}
   end
 
-  def handle_call_event({:commit_transaction, start_time}, :transaction_in_progress, data) do
-    case run_commit_command(data, start_time) do
+  # After a writeConcernError the commit is applied but not confirmed, so a repeated commit is a retry and an abort sends nothing.
+  def handle_call_event({:commit_transaction, start_time}, transaction, data) when transaction in [:transaction_in_progress, :transaction_commit_unconfirmed] do
+    attempt = if transaction == :transaction_commit_unconfirmed, do: :retry, else: :first
+
+    case run_commit_command(data, start_time, attempt) do
       :ok -> {:next_state, :transaction_committed, :ok}
+      {:write_concern_error, error} -> {:next_state, :transaction_commit_unconfirmed, {:error, error}}
       error -> {:keep_state_and_data, error}
     end
   end
@@ -558,6 +571,14 @@ defmodule Mongo.Session do
   end
 
   def handle_call_event(:abort_transaction, _state, _data) do
+    {:keep_state_and_data, :ok}
+  end
+
+  def handle_call_event(:mark_aborted, transaction, _data) when transaction in [:starting_transaction, :transaction_in_progress] do
+    {:next_state, :transaction_aborted, :ok}
+  end
+
+  def handle_call_event(:mark_aborted, _state, _data) do
     {:keep_state_and_data, :ok}
   end
 
@@ -606,17 +627,13 @@ defmodule Mongo.Session do
   ##
   # Run the commit transaction command.
   #
-  defp run_commit_command(session, start_time) do
-    run_commit_command(session, start_time, :first)
-  end
-
   defp run_commit_command(%Session{conn: conn, recovery_token: recovery_token, server_session: %ServerSession{session_id: id, txn_num: txn_num}, opts: opts} = session, time, n) do
     ##
-    # Drivers should apply a majority write concern when retrying commitTransaction to guard against a transaction being applied twice.
+    # A retried commit waits for a majority so that it cannot apply twice, and without a wtimeout it gets one so that it cannot wait forever.
     write_concern =
       case n do
         :first -> write_concern(opts)
-        _ -> Map.put(write_concern(opts) || %{}, :w, :majority)
+        :retry -> (write_concern(opts) || %{}) |> Map.put(:w, :majority) |> Map.put_new(:wtimeout, @retry_commit_wtimeout_ms)
       end
 
     cmd =
@@ -631,7 +648,11 @@ defmodule Mongo.Session do
       ]
       |> filter_nils()
 
-    case Mongo.exec_command(conn, cmd, database: "admin") do
+    case Mongo.exec_command(conn, cmd, merge_timeout([database: "admin"], opts)) do
+      {:ok, {_flags, %{"writeConcernError" => wce} = doc}} ->
+        labels = ["UnknownTransactionCommitResult" | doc["errorLabels"] || []]
+        {:write_concern_error, Mongo.Error.exception(%{"code" => wce["code"], "errmsg" => wce["errmsg"] || "write concern error", "errInfo" => wce["errInfo"], "errorLabels" => labels})}
+
       {:ok, _doc} ->
         :ok
 
@@ -641,10 +662,17 @@ defmodule Mongo.Session do
 
         case try_again do
           true -> run_commit_command(session, time, :retry)
-          false -> {:error, error}
+          false -> {:error, label_network_error(error)}
         end
     end
   end
+
+  # A lost commit reply has an unknown outcome; labelled after the retry decision so a socket timeout is not retried past its budget.
+  defp label_network_error(%Mongo.Error{code: nil, host: host, error_labels: labels} = error) when is_binary(host) do
+    %Mongo.Error{error | error_labels: ["UnknownTransactionCommitResult" | labels || []]}
+  end
+
+  defp label_network_error(error), do: error
 
   defp max_time_ms(opts) do
     opts |> Keyword.get(:max_commit_time_ms) |> optional_int64()
@@ -667,7 +695,7 @@ defmodule Mongo.Session do
       ]
       |> filter_nils()
 
-    _doc = Mongo.exec_command(conn, cmd, database: "admin")
+    _doc = Mongo.exec_command(conn, cmd, merge_timeout([database: "admin"], opts))
 
     :ok
   end

@@ -210,10 +210,11 @@ defmodule Mongo do
 
       {:error, error} ->
         ## check in case of an error while processing transaction
-        Session.abort_transaction(session)
+        if server_aborted?(error), do: Session.mark_aborted(session), else: Session.abort_transaction(session)
         timeout = opts[:transaction_retry_timeout_s] || @retry_timeout_seconds
 
-        case Error.has_label(error, "TransientTransactionError") && DateTime.diff(DateTime.utc_now(), start_time, :second) < timeout do
+        case Error.has_label(error, "TransientTransactionError") && DateTime.diff(DateTime.utc_now(), start_time, :second) < timeout &&
+               sleep_retry_jitter(opts[:transaction_retry_jitter_ms], start_time, timeout) do
           true ->
             run_in_transaction(topology_pid, session, fun, start_time, opts)
 
@@ -231,6 +232,20 @@ defmodule Mongo do
         {:error, other}
     end
   end
+
+  # WriteConflict and NoSuchTransaction mean the server already aborted the transaction
+  defp server_aborted?(%Mongo.Error{code: code}), do: code in [112, 251]
+  defp server_aborted?(_error), do: false
+
+  # The jitter never sleeps past the rerun window, and no rerun starts after it.
+  defp sleep_retry_jitter(jitter_ms, start_time, timeout_s) when is_integer(jitter_ms) and jitter_ms > 0 do
+    Process.sleep(min(:rand.uniform(jitter_ms), max(remaining_ms(start_time, timeout_s), 0)))
+    remaining_ms(start_time, timeout_s) > 0
+  end
+
+  defp sleep_retry_jitter(_jitter_ms, _start_time, _timeout_s), do: true
+
+  defp remaining_ms(start_time, timeout_s), do: trunc(timeout_s * 1_000) - DateTime.diff(DateTime.utc_now(), start_time, :millisecond)
 
   ##
   # calling the function and wrapping it to catch exceptions
