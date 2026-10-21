@@ -6,25 +6,26 @@ on:
   pull_request:
     branches:
       - master
+  workflow_dispatch:
 
 jobs:
   test:
     name: Compile and Test
-    timeout-minutes: 5
+    timeout-minutes: 15
 
     strategy:
+      fail-fast: false
       matrix:
-        mongodb-version: ["5.0", "6.0", "7.0", "8.0"]
+        mongodb-version: ["5.0", "6.0", "7.0", "8.0", "9.0"]
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v2
 
-      - name: Start MongoDB
-        uses: supercharge/mongodb-github-action@1.11.0
-        with:
-          mongodb-version: ${{ matrix.mongodb-version }}
-          mongodb-replica-set: rs_1
+      - name: Start MongoDB replica sets
+        run: uname -r >&2 && .github/scripts/mongodb-test-env.sh up >> "$GITHUB_ENV"
+        env:
+          MONGO_VERSION: ${{ matrix.mongodb-version }}
 
       - name: Read .tool-versions
         uses: marocchino/tool-versions-action@v1
@@ -50,7 +51,7 @@ jobs:
         run: mix deps.get
 
       - name: Run tests
-        run: mix test --exclude ssl --exclude socket --exclude rs_required
+        run: mix test
 
       - name: Run Credo
         run: mix credo
