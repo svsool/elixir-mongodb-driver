@@ -1598,7 +1598,7 @@ defmodule Mongo do
   def retryable_writes(opts, true) do
     case opts[:write_counter] do
       nil ->
-        case Keyword.get(opts, :retryable_writes, true) == true && opts[:session] == nil do
+        case Keyword.get(opts, :retryable_writes) == true && opts[:session] == nil do
           true -> opts ++ [write_counter: 1]
           false -> opts
         end
@@ -1639,30 +1639,23 @@ defmodule Mongo do
   end
 
   def issue_command(topology_pid, cmd, :write, opts) do
-    ## check, if retryable reads are enabled
-    opts =
-      opts
-      |> Keyword.delete(:read_preferences)
-      |> Mongo.retryable_writes(acknowledged?(cmd[:writeConcerns]))
+    opts = Mongo.retryable_writes(opts, acknowledged?(cmd[:writeConcern]))
 
-    case in_write_session(topology_pid, &exec_command_session(&1, cmd, &2), opts) do
+    case topology_pid |> in_write_session(&exec_command_session(&1, cmd, &2), opts) |> write_concern_error_as_error() do
       {:ok, doc} ->
         {:ok, doc}
 
       {:error, error} ->
-        cond do
-          Error.not_writable_primary_or_recovering?(error, opts) ->
-            ## in case of explicitly
-            issue_command(topology_pid, cmd, :read, Keyword.put(opts, :retry_counter, 2))
-
-          Error.should_retry_write(error, cmd, opts) ->
-            issue_command(topology_pid, cmd, :write, Keyword.put(opts, :write_counter, 2))
-
-          true ->
-            {:error, error}
+        if Error.should_retry_write(error, cmd, opts) do
+          issue_command(topology_pid, cmd, :write, Keyword.put(opts, :write_counter, 2))
+        else
+          {:error, error}
         end
     end
   end
+
+  defp write_concern_error_as_error({:ok, %{"writeConcernError" => wce} = doc}), do: {:error, Error.write_concern_error(wce, doc["errorLabels"] || [])}
+  defp write_concern_error_as_error(result), do: result
 
   @doc false
   @spec exec_command_session(GenServer.server(), BSON.document(), Keyword.t()) ::

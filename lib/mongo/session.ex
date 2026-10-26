@@ -556,7 +556,7 @@ defmodule Mongo.Session do
 
     case run_commit_command(data, start_time, attempt) do
       :ok -> {:next_state, :transaction_committed, :ok}
-      {:write_concern_error, error} -> {:next_state, :transaction_commit_unconfirmed, {:error, error}}
+      {:error, %Mongo.Error{write_concern_error: true}} = error -> {:next_state, :transaction_commit_unconfirmed, error}
       error -> {:keep_state_and_data, error}
     end
   end
@@ -667,8 +667,8 @@ defmodule Mongo.Session do
 
     case Mongo.exec_command(conn, cmd, merge_timeout([database: "admin"], opts)) do
       {:ok, {_flags, %{"writeConcernError" => wce} = doc}} ->
-        labels = ["UnknownTransactionCommitResult" | doc["errorLabels"] || []]
-        {:write_concern_error, Mongo.Error.exception(%{"code" => wce["code"], "errmsg" => wce["errmsg"] || "write concern error", "errInfo" => wce["errInfo"], "errorLabels" => labels})}
+        labels = Enum.uniq(["UnknownTransactionCommitResult" | doc["errorLabels"] || []])
+        {:error, Mongo.Error.write_concern_error(wce, labels)}
 
       {:ok, _doc} ->
         :ok
@@ -679,17 +679,28 @@ defmodule Mongo.Session do
 
         case try_again do
           true -> run_commit_command(session, time, :retry)
-          false -> {:error, label_network_error(error, n)}
+          false -> {:error, label_unknown_commit_result(error, n)}
         end
     end
   end
 
-  # A lost commit reply, or a retry that got no server reply, leaves the outcome unknown; labelled after the retry decision so a socket timeout is not retried past its budget.
-  defp label_network_error(%Mongo.Error{code: nil, host: host, error_labels: labels} = error, attempt) when is_binary(host) or attempt == :retry do
-    %Mongo.Error{error | error_labels: ["UnknownTransactionCommitResult" | labels || []]}
+  # Labelled after the retry decision, so the label never adds a commit retry; TransientTransactionError means not applied, so it gets no second label.
+  defp label_unknown_commit_result(%Mongo.Error{error_labels: labels} = error, attempt) do
+    if unknown_commit_result?(error, attempt) and not Enum.any?(labels || [], &(&1 in ["UnknownTransactionCommitResult", "TransientTransactionError"])) do
+      %Mongo.Error{error | error_labels: ["UnknownTransactionCommitResult" | labels || []]}
+    else
+      error
+    end
   end
 
-  defp label_network_error(error, _attempt), do: error
+  defp label_unknown_commit_result(error, _attempt), do: error
+
+  # A lost reply, a retryable error, MaxTimeMSExpired (50) and any error after a retry, which may follow an applied first attempt, leave the commit outcome unknown.
+  defp unknown_commit_result?(_error, :retry), do: true
+  defp unknown_commit_result?(%Mongo.Error{code: nil, host: host}, _attempt) when is_binary(host), do: true
+  defp unknown_commit_result?(%Mongo.Error{code: 50}, _attempt), do: true
+  defp unknown_commit_result?(%Mongo.Error{retryable_writes: true}, _attempt), do: true
+  defp unknown_commit_result?(_error, _attempt), do: false
 
   defp max_time_ms(opts) do
     opts |> Keyword.get(:max_commit_time_ms) |> optional_int64()

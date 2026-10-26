@@ -1,7 +1,7 @@
 defmodule Mongo.Error do
   alias Mongo.Events
 
-  defexception [:message, :code, :host, :fail_command, :error_labels, :resumable, :retryable_reads, :retryable_writes, :not_writable_primary_or_recovering, :error_info]
+  defexception [:message, :code, :host, :fail_command, :error_labels, :resumable, :retryable_reads, :retryable_writes, :not_writable_primary_or_recovering, :error_info, write_concern_error: false]
 
   @exceeded_time_limit 262
   @failed_to_satisfy_read_preference 133
@@ -91,7 +91,8 @@ defmodule Mongo.Error do
           retryable_reads: boolean,
           retryable_writes: boolean,
           not_writable_primary_or_recovering: boolean,
-          error_info: map()
+          error_info: map(),
+          write_concern_error: boolean
         }
 
   def message(e) do
@@ -135,6 +136,14 @@ defmodule Mongo.Error do
 
   def exception(message) do
     %Mongo.Error{message: message, resumable: false}
+  end
+
+  @doc """
+  Builds the error for a `writeConcernError` block of an `ok: 1` reply.
+  """
+  def write_concern_error(wce, error_labels) do
+    %Mongo.Error{} = error = exception(%{"code" => wce["code"], "errmsg" => wce["errmsg"] || "write concern error", "errInfo" => wce["errInfo"], "errorLabels" => error_labels})
+    %Mongo.Error{error | write_concern_error: true}
   end
 
   @doc """
@@ -216,8 +225,7 @@ defmodule Mongo.Error do
   end
 
   defp maybe_add_error_info(error, %{"errInfo" => info}) do
-    error
-    |> Map.put_new(:error_info, info)
+    %Mongo.Error{error | error_info: info}
   end
 
   defp maybe_add_error_info(error, _), do: error

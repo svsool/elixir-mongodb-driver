@@ -19,7 +19,7 @@ defmodule Mongo.CommitWriteConcernTest do
     coll = unique_collection()
     fail_commit(top, @write_concern_error)
 
-    assert {:error, %Error{code: 64} = error} = insert_in_transaction(top, coll, %{_id: 1}, w: :majority)
+    assert {:error, %Error{code: 64, write_concern_error: true} = error} = insert_in_transaction(top, coll, %{_id: 1}, w: :majority)
     assert Error.has_label(error, "UnknownTransactionCommitResult")
     assert %{commitTransaction: 1, abortTransaction: 0} = command_counts(catcher)
     assert %{"_id" => 1} = Mongo.find_one(top, coll, %{_id: 1})
@@ -86,10 +86,21 @@ defmodule Mongo.CommitWriteConcernTest do
   @tag :rs_required
   test "a failed commit still sends an abort", %{top: top, catcher: catcher} do
     coll = unique_collection()
-    fail_commit(top, errorCode: 50)
+    fail_commit(top, errorCode: 50, errorLabels: [])
 
-    assert {:error, %Error{code: 50}} = insert_in_transaction(top, coll, %{_id: 1}, w: :majority)
+    assert {:error, %Error{code: 50, write_concern_error: false} = error} = insert_in_transaction(top, coll, %{_id: 1}, w: :majority)
+    assert Error.has_label(error, "UnknownTransactionCommitResult")
     assert %{commitTransaction: 1, abortTransaction: 1} = command_counts(catcher)
+  end
+
+  @tag :rs_required
+  test "a top-level retryable commit error gets the unknown commit label and is not retried", %{top: top, catcher: catcher} do
+    coll = unique_collection()
+    fail_commit(top, errorCode: 189, errorLabels: [])
+
+    assert {:error, %Error{code: 189} = error} = insert_in_transaction(top, coll, %{_id: 1}, w: :majority)
+    assert Error.has_label(error, "UnknownTransactionCommitResult")
+    assert %{commitTransaction: 1} = command_counts(catcher)
   end
 
   defp fail_commit(top, data) do

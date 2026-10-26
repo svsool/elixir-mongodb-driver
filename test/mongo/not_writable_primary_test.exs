@@ -7,7 +7,7 @@ defmodule Mongo.NotWritablePrimaryTest do
     %{pid: top}
   end
 
-  test "not writable primary", c do
+  test "not writable primary returns the error", c do
     top = c.pid
 
     cmd = [
@@ -18,6 +18,7 @@ defmodule Mongo.NotWritablePrimaryTest do
 
     assert {:ok, %Mongo.InsertOneResult{}} = Mongo.insert_one(top, "users", %{name: "Greta1"})
     Mongo.admin_command(top, cmd)
-    assert {:ok, %Mongo.InsertOneResult{}} = Mongo.insert_one(top, "users", %{name: "Greta2"})
+    assert {:error, %Mongo.Error{code: 10_107}} = Mongo.insert_one(top, "users", %{name: "Greta2"})
+    assert nil == Mongo.find_one(top, "users", %{name: "Greta2"})
   end
 end
