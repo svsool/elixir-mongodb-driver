@@ -224,7 +224,7 @@ defmodule Mongo.Error do
     fail_command
   end
 
-  defp maybe_add_error_info(error, %{"errInfo" => info}) do
+  defp maybe_add_error_info(%Mongo.Error{} = error, %{"errInfo" => info}) do
     %Mongo.Error{error | error_info: info}
   end
 
